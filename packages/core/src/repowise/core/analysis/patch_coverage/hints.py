@@ -264,9 +264,22 @@ async def _read_test_hints(
     working_tree: bool,
 ) -> dict[str, tuple[TestHint, ...]]:
     """Batched reads for the whole change: symbols, per-test rows, the reverse test walk."""
+    from repowise.core.analysis.test_reach import cached_file_paths
     from repowise.core.persistence.crud.analysis.coverage_map import tests_covering_files
 
-    files = [f for f in pc.with_status("measured") if f.uncovered_ranges]
+    # A file the index has not seen (one the change adds) gets no hint: the
+    # graph cannot say which test reaches it, so "no test reaches this" would
+    # be a guess (``pr_blast.file_tests`` calls it ``new``). No file nodes at
+    # all is no index to judge by, and every file keeps its hint.
+    try:
+        known = await cached_file_paths(session, repository_id)
+    except Exception:
+        known = frozenset()
+    files = [
+        f
+        for f in pc.with_status("measured")
+        if f.uncovered_ranges and (not known or f.file_path in known)
+    ]
     if not files:
         return {}
     paths = sorted(f.file_path for f in files)

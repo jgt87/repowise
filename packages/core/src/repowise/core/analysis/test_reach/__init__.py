@@ -99,6 +99,17 @@ real gap in the sample kept; 32 of 35 sampled files it newly calls tested
 were. The import tier's default stays 1, so test ranking and selection are
 unchanged.
 
+Last, :func:`~.walk.use_walk` lets reach cross packages on symbol evidence:
+call edges back from the file's symbols (``DEFAULT_CALL_DEPTH``) to code in
+other files that calls into it, then the tests that call that code or load its
+file. Importing something that imports the file is not enough, a symbol with
+more than ``HUB_MIN_FAN_IN`` callers in code neither carries nor joins, and a
+``conftest.py`` loading every router is no test. Files with no code of their
+own (re-export barrels, ``package-info.java``) are ``type_only``. On the
+labelled set in ``tests/fixtures/untested_eval`` (149 files, Python,
+TypeScript, Go, Java), precision of "untested" rose from 55% to 84% with
+recall of real gaps unchanged at 88%.
+
 Why recall reads low, and why that is not the graph's fault
 -----------------------------------------------------------
 27.7% looks poor for a graph this dense, and the reason is what the ground truth
@@ -188,6 +199,7 @@ from .db import (
     placed_test_files,
     reach_into_symbols,
     reach_states_from_db,
+    stored_origins,
     tests_reaching,
     tests_reaching_by_tier,
     tests_reaching_through_helpers,
@@ -274,6 +286,7 @@ __all__ = [
     "replaced_files",
     "replaced_modules",
     "rust_has_inline_tests",
+    "stored_origins",
     "tests_matching_by_name",
     "tests_reaching",
     "tests_reaching_by_tier",
