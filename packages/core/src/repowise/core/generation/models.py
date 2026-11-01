@@ -74,11 +74,11 @@ def _positive_int(value: object, name: str) -> int:
 
 def _source_evidence_page_keys() -> set[str]:
     """Return synthesis page keys that have a model-written consumer."""
-    from .onboarding.slots import ONBOARDING_ORDER, PROMOTED_SLOTS
+    from .onboarding.slots import ONBOARDING_SLOTS, PROMOTED_SLOTS
 
     promoted = set(PROMOTED_SLOTS.values())
     return {"repo_overview"} | {
-        f"onboarding/{slot}" for slot in ONBOARDING_ORDER if slot not in promoted
+        f"onboarding/{slot}" for slot in ONBOARDING_SLOTS if slot not in promoted
     }
 
 
