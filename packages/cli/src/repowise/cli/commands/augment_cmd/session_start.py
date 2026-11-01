@@ -26,11 +26,25 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from repowise.cli.helpers import as_commit_id
+# The leaf module, not the ``helpers`` facade: the facade imports rich and
+# asyncio, which every hook call would pay at import.
+from repowise.cli._helpers.git import as_commit_id
 
 from ._shared import _find_repo_root, emitting_build
 from .bash_staleness import _read_in_flight_marker
-from .decision_inject import _session_decision_block
+from .decision_inject import _session_decision_block as _decision_block
+from .fast_lookup import index_locked
+
+
+def _session_decision_block(repo_path: Path, session_id: str) -> str | None:
+    """The standing-decisions block, or None while another process locks the index.
+
+    A locked index fails every decision query anyway, each after its own busy
+    wait; one probe answers the same within one wait.
+    """
+    if index_locked(repo_path):
+        return None
+    return _decision_block(repo_path, session_id)
 
 #: The tools this block points a fresh session at. **Entry points only.**
 #:
