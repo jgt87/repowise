@@ -14,10 +14,12 @@ co_change_partners_json field stored in git_metadata rows.
 
 from __future__ import annotations
 
+import asyncio
 import math
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 from sqlalchemy import select, text
@@ -27,7 +29,8 @@ from repowise.core.analysis.risk_semantics import structural_impact_contract
 from repowise.core.co_change import parse_partners
 from repowise.core.exclusion import build_exclude_spec, is_excluded
 from repowise.core.ingestion.models import FILE_DEPENDENCY_EDGE_TYPES
-from repowise.core.persistence.models import GitMetadata, GraphNode, Repository
+from repowise.core.persistence.index_cache import IndexStampCache
+from repowise.core.persistence.models import GitMetadata, GraphNode, HealthFileMetric, Repository
 
 
 def rank_tests_by_reach(by_file: Mapping[str, Iterable[str]]) -> list[str]:
@@ -167,6 +170,28 @@ async def _code_file_tests(
     return rows
 
 
+#: Package manifests per index state: scanning a checkout's package roots
+#: takes most of a second on a large repository, and they move only with it.
+_MANIFESTS = IndexStampCache(8)
+
+
+async def _test_runs(session: AsyncSession, repo_id: str, tests: list[str]) -> dict[str, list[str | None]]:
+    """Where each test runs (``npm --prefix pkg test``, a Go package...), from the
+    checkout's package roots. Without a checkout, only root-level JS runs are known."""
+    from repowise.core.analysis.health.refactoring.commands import js_root_runs, runs_for_tests
+    from repowise.core.ingestion.package_roots import scan_package_manifests
+
+    root = (
+        await session.execute(select(Repository.local_path).where(Repository.id == repo_id))
+    ).scalar_one_or_none()
+    if not root or not Path(root).is_dir():
+        return js_root_runs(tests)
+    key = await _MANIFESTS.key(session, repo_id, root)
+    if key not in _MANIFESTS:
+        _MANIFESTS.remember(key, await asyncio.to_thread(scan_package_manifests, root))
+    return await asyncio.to_thread(runs_for_tests, Path(root), _MANIFESTS.get(key), tests)
+
+
 class PRBlastRadiusAnalyzer:
     """Compute blast radius for a proposed PR given its changed files."""
 
@@ -185,6 +210,8 @@ class PRBlastRadiusAnalyzer:
         changed_files: list[str],
         max_depth: int = 3,
         exclude_spec: Any = None,
+        *,
+        with_graph: bool = False,
     ) -> dict:
         """Return full blast-radius analysis for the given changed files.
 
@@ -194,6 +221,11 @@ class PRBlastRadiusAnalyzer:
             Relative file paths that are modified in the PR.
         max_depth:
             Maximum BFS depth for transitive ancestor lookup.
+        with_graph:
+            Also name, for each transitive file, the file it was reached
+            through (``via``), and add ``affected_signals``: per affected
+            file, its hotspot verdict, health score and module. Off by
+            default, so the MCP reply that reuses this analysis keeps its size.
         """
         if exclude_spec is None:
             repo_path = (
@@ -213,7 +245,7 @@ class PRBlastRadiusAnalyzer:
 
         # 2. Transitive affected files
         transitive_affected = await self._transitive_affected(
-            changed_files, max_depth, exclude_spec
+            changed_files, max_depth, exclude_spec, with_via=with_graph
         )
         # Sorted, because this list is cut before it is shown. ``test_gaps``
         # preserves this order and ``get_risk``'s PR directive renders three of
@@ -228,7 +260,7 @@ class PRBlastRadiusAnalyzer:
         cochange_warnings = await self._cochange_warnings(changed_files, changed_set)
 
         # 4. Recommended reviewers (over all affected files)
-        recommended_reviewers = await self._recommend_reviewers(all_affected_paths)
+        recommended_reviewers = await self._recommend_reviewers(all_affected_paths, with_names=with_graph)
 
         # 5. Test gaps
         test_gaps = await self._find_test_gaps(all_affected_paths)
@@ -240,7 +272,7 @@ class PRBlastRadiusAnalyzer:
         #    exact alias supplied by the shared public semantics contract.
         structural_impact_score = self._compute_overall_risk(direct_risks, transitive_affected)
 
-        return {
+        result = {
             "direct_risks": direct_risks,
             "transitive_affected": transitive_affected,
             "cochange_warnings": cochange_warnings,
@@ -248,6 +280,23 @@ class PRBlastRadiusAnalyzer:
             "test_gaps": test_gaps,
             "test_impact": test_impact,
             **structural_impact_contract(structural_impact_score),
+        }
+        if with_graph:
+            result.update(await self._screen_extras(all_affected_paths, changed_files, test_impact))
+        return result
+
+    async def _screen_extras(
+        self, affected: list[str], changed_files: list[str], test_impact: dict
+    ) -> dict[str, Any]:
+        """What a review screen adds: per-file signals, who owns the changed
+        files, and the commands that run the recommended tests."""
+        from repowise.core.analysis.test_reachability import cached_test_files
+
+        test_files = await cached_test_files(self._session, self._repo_id)
+        return {
+            "affected_signals": await self._affected_signals(affected, test_files),
+            "changed_owners": await self._changed_owners(changed_files),
+            "test_commands": await self._test_commands(test_impact),
         }
 
     # ------------------------------------------------------------------
@@ -324,7 +373,12 @@ class PRBlastRadiusAnalyzer:
         return centrality * (1.0 + temporal_hotspot_score)
 
     async def _transitive_affected(
-        self, changed_files: list[str], max_depth: int, exclude_spec: Any = None
+        self,
+        changed_files: list[str],
+        max_depth: int,
+        exclude_spec: Any = None,
+        *,
+        with_via: bool = False,
     ) -> list[dict]:
         """BFS over reverse graph edges (source_node_id -> target_node_id direction).
 
@@ -346,6 +400,8 @@ class PRBlastRadiusAnalyzer:
         :meth:`_cochange_warnings`.
         """
         visited: dict[str, int] = {}  # path -> depth at which it was first reached
+        # path -> the first (sorted) frontier file it imports, for a drawing.
+        via: dict[str, str] = {}
         # Sorted, not just deduped. This walk's output is cut twice downstream
         # — ``may_break`` takes 15 of it, and that is the first field
         # ``get_risk``'s PR directive tells an agent to read — so the order
@@ -365,7 +421,7 @@ class PRBlastRadiusAnalyzer:
             params.update({f"e{i}": v for i, v in enumerate(sorted(FILE_DEPENDENCY_EDGE_TYPES))})
             rows = await self._session.execute(
                 text(
-                    f"SELECT DISTINCT e.source_node_id FROM graph_edges e "
+                    f"SELECT DISTINCT e.source_node_id, e.target_node_id FROM graph_edges e "
                     f"JOIN graph_nodes source ON source.repository_id = e.repository_id "
                     f"AND source.node_id = e.source_node_id AND source.node_type = 'file' "
                     f"JOIN graph_nodes target ON target.repository_id = e.repository_id "
@@ -376,16 +432,17 @@ class PRBlastRadiusAnalyzer:
                 ),
                 params,
             )
-            next_frontier = []
-            for (src,) in rows:
-                if (
-                    src not in visited
-                    and src not in set(changed_files)
-                    and not is_excluded(src, exclude_spec)
-                ):
-                    visited[src] = depth
-                    next_frontier.append(src)
-            frontier = next_frontier
+            changed = set(changed_files)
+            reached: dict[str, str] = {}
+            for src, target in rows:
+                if src in visited or src in changed or is_excluded(src, exclude_spec):
+                    continue
+                if src not in reached or target < reached[src]:
+                    reached[src] = target
+            for src in sorted(reached):
+                visited[src] = depth
+                via[src] = reached[src]
+            frontier = sorted(reached)
 
         # Depth first, then path: a sort on depth alone is stable, so files
         # sharing a depth kept the row order the query happened to return.
@@ -399,9 +456,92 @@ class PRBlastRadiusAnalyzer:
                 "evidence_kind": "structural",
                 "claim": "structural_reach",
                 "runtime_breakage_claim": False,
+                **({"via": via[p]} if with_via else {}),
             }
             for p, d in sorted(visited.items(), key=lambda item: (item[1], item[0]))
         ]
+
+    async def _affected_signals(
+        self, paths: list[str], test_files: frozenset[str] = frozenset()
+    ) -> list[dict]:
+        """Per affected file: hotspot verdict, health score, module, and whether it is a test.
+
+        ``health_score`` and ``module`` stay ``None`` for a file health never
+        scored; ``is_hotspot`` is ``None`` for a file with no git history row.
+        A missing signal is never read as healthy or cold. ``is_test`` lets a
+        screen count the tests a change reaches apart from the code it reaches.
+        """
+        if not paths:
+            return []
+        hotspot: dict[str, bool] = {}
+        health: dict[str, tuple[float | None, str | None]] = {}
+        # Chunked: a branch can reach thousands of files and SQLite caps bound
+        # parameters per statement.
+        for i in range(0, len(paths), 500):
+            chunk = paths[i : i + 500]
+            for path, is_hot in await self._session.execute(
+                select(GitMetadata.file_path, GitMetadata.is_hotspot).where(
+                    GitMetadata.repository_id == self._repo_id,
+                    GitMetadata.file_path.in_(chunk),
+                )
+            ):
+                hotspot[path] = bool(is_hot)
+            for path, score, module in await self._session.execute(
+                select(
+                    HealthFileMetric.file_path, HealthFileMetric.score, HealthFileMetric.module
+                ).where(
+                    HealthFileMetric.repository_id == self._repo_id,
+                    HealthFileMetric.file_path.in_(chunk),
+                )
+            ):
+                health[path] = (score, module)
+        return [
+            {
+                "path": p,
+                "is_hotspot": hotspot.get(p),
+                "health_score": health.get(p, (None, None))[0],
+                "module": health.get(p, (None, None))[1],
+                "is_test": p in test_files,
+            }
+            for p in paths
+        ]
+
+    async def _changed_owners(self, changed_files: list[str], limit: int = 3) -> list[dict]:
+        """Who owns the changed files themselves, most files first.
+
+        Unlike :meth:`_recommend_reviewers`, which counts every affected file,
+        this is the person who knows the code being changed: "owns 8 of the 12
+        changed files" is a reason to ask; "owns 1,800 affected files" is not.
+        """
+        rows = await self._session.execute(
+            select(
+                GitMetadata.primary_owner_email, GitMetadata.primary_owner_name
+            ).where(
+                GitMetadata.repository_id == self._repo_id,
+                GitMetadata.file_path.in_(changed_files[:500]),
+            )
+        )
+        files: Counter[str] = Counter()
+        names: dict[str, str] = {}
+        for email, name in rows:
+            if email:
+                files[email] += 1
+                if name:
+                    names.setdefault(email, name)
+        ranked = sorted(files.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+        return [{"email": e, "name": names.get(e), "files": n} for e, n in ranked]
+
+    async def _test_commands(self, test_impact: dict) -> list[str]:
+        """The commands that run the recommended tests, one per runner."""
+        from repowise.core.analysis.health.refactoring.commands import commands_for_tests
+
+        tests = [r["test_id"] for r in test_impact.get("recommendations", [])]
+        if not tests:
+            return []
+        runs = await _test_runs(self._session, self._repo_id, tests)
+        return commands_for_tests(
+            tests, total=test_impact.get("recommendations_total"), runs=runs
+        )
 
     async def _cochange_warnings(
         self, changed_files: list[str], changed_set: set[str]
@@ -438,8 +578,14 @@ class PRBlastRadiusAnalyzer:
         warnings.sort(key=lambda x: -x["score"])
         return warnings
 
-    async def _recommend_reviewers(self, affected_files: list[str]) -> list[dict]:
-        """Aggregate top owners of affected files; return top 5."""
+    async def _recommend_reviewers(
+        self, affected_files: list[str], *, with_names: bool = False
+    ) -> list[dict]:
+        """Aggregate top owners of affected files; return top 5.
+
+        *with_names* adds each owner's display name from git history, for a
+        screen; off by default so the MCP reply keeps its size.
+        """
         if not affected_files:
             return []
 
@@ -451,17 +597,21 @@ class PRBlastRadiusAnalyzer:
         )
 
         owner_files: dict[str, list[float]] = defaultdict(list)
+        names: dict[str, str] = {}
         for meta in res.scalars().all():
             email = meta.primary_owner_email or ""
             pct = float(meta.primary_owner_commit_pct or 0.0)
             if email:
                 owner_files[email].append(pct)
+                if meta.primary_owner_name:
+                    names.setdefault(email, meta.primary_owner_name)
 
         reviewers: list[dict[str, Any]] = [
             {
                 "email": email,
                 "files": len(pcts),
                 "ownership_pct": round(sum(pcts) / len(pcts), 3) if pcts else 0.0,
+                **({"name": names.get(email)} if with_names else {}),
             }
             for email, pcts in owner_files.items()
         ]
